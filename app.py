@@ -8,6 +8,7 @@ Connects to the local proxy at localhost:8082 (no API key needed).
 import asyncio
 import base64
 import os
+import traceback
 
 import streamlit as st
 
@@ -31,6 +32,8 @@ def setup():
         st.session_state.messages = []
     if "agent_messages" not in st.session_state:
         st.session_state.agent_messages = []
+    if "running" not in st.session_state:
+        st.session_state.running = False
 
 
 def render_messages():
@@ -43,17 +46,17 @@ def render_messages():
                 st.markdown(msg["text"])
             if msg.get("action"):
                 st.code(msg["action"])
+            if msg.get("error"):
+                st.error(msg["error"])
 
 
-async def run_agent(user_text: str):
-    """Run the agent and collect results for display."""
+def run_agent_sync(user_text: str):
+    """Run the agent synchronously (Streamlit doesn't play well with asyncio.run)."""
     proxy_url = st.session_state.get(
         "proxy_url", os.getenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:8082")
     )
     model = st.session_state.get("model", "claude-sonnet-4-6")
-
     display_messages = st.session_state.messages
-    status = st.empty()
 
     def on_output(block):
         if block.get("type") == "text":
@@ -65,25 +68,31 @@ async def run_agent(user_text: str):
     def on_tool(name, result):
         if result["type"] == "image":
             display_messages.append(
-                {"role": "assistant", "text": "Screenshot captured:", "image": result["base64"]}
+                {"role": "assistant", "text": "Screenshot:", "image": result["base64"]}
             )
         else:
             display_messages.append({"role": "assistant", "text": f"*{result['text']}*"})
 
-    status.info("Agent is running...")
-
-    agent_msgs = await agent_loop(
-        user_message=user_text,
-        model=model,
-        base_url=proxy_url,
-        api_key="proxy-handles-auth",
-        max_turns=int(st.session_state.get("max_turns", 15)),
-        output_callback=on_output,
-        tool_callback=on_tool,
-    )
-
-    st.session_state.agent_messages = agent_msgs
-    status.empty()
+    # Run the async agent loop — create a fresh event loop to avoid
+    # conflicts with Streamlit's own loop.
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(
+            agent_loop(
+                user_message=user_text,
+                model=model,
+                base_url=proxy_url,
+                api_key="proxy-handles-auth",
+                max_turns=int(st.session_state.get("max_turns", 15)),
+                output_callback=on_output,
+                tool_callback=on_tool,
+            )
+        )
+    except Exception as e:
+        error_msg = f"Agent error: {e}\n\n```\n{traceback.format_exc()}\n```"
+        display_messages.append({"role": "assistant", "error": error_msg})
+    finally:
+        loop.close()
 
 
 def main():
@@ -118,15 +127,30 @@ def main():
 
         # Quick screenshot preview
         if st.button("Preview Screenshot"):
-            img = take_screenshot()
-            st.image(base64.b64decode(base64.b64encode(
-                base64.b64decode(img)
-            )))
+            img_b64 = take_screenshot()
+            st.image(base64.b64decode(img_b64))
 
         if st.button("Clear Chat", type="secondary"):
             st.session_state.messages = []
             st.session_state.agent_messages = []
             st.rerun()
+
+        st.divider()
+
+        # Connection check
+        try:
+            import httpx
+            r = httpx.get(
+                st.session_state.get("proxy_url", "http://127.0.0.1:8082") + "/health",
+                timeout=3,
+            )
+            health = r.json()
+            if health.get("authenticated"):
+                st.success("Proxy connected")
+            else:
+                st.warning("Proxy running but not authenticated. Run `claude` to log in.")
+        except Exception:
+            st.error("Proxy not running. Start it with `start-proxy.bat`")
 
         st.divider()
         st.markdown(
@@ -149,7 +173,7 @@ def main():
             st.markdown(user_input)
 
         with st.spinner("Agent working..."):
-            asyncio.run(run_agent(user_input))
+            run_agent_sync(user_input)
 
         st.rerun()
 
