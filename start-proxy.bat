@@ -1,16 +1,24 @@
 @echo off
 echo ============================================
-echo   OAuth Proxy Server - Starting
+echo   OAuth Proxy - Starting
 echo ============================================
 echo.
 
-:: Activate virtual environment
-call .venv\Scripts\activate.bat
+where node >nul 2>&1
+if errorlevel 1 (
+    echo ERROR: Node.js is not installed.
+    echo Download it from https://nodejs.org
+    pause
+    exit /b 1
+)
 
-echo Starting proxy server on port 9090...
-echo Health check: http://localhost:9090/health
-echo.
-echo Press Ctrl+C to stop.
-echo.
-
-python -m proxy.server
+if exist "%USERPROFILE%\.claude\proxy\server.js" (
+    echo Starting proxy from Claude Code installation...
+    node "%USERPROFILE%\.claude\proxy\server.js"
+) else (
+    echo ERROR: Proxy not found at %USERPROFILE%\.claude\proxy\server.js
+    echo.
+    echo See README.md "Proxy Setup" section for installation instructions.
+    pause
+    exit /b 1
+)

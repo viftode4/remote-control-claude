@@ -25,21 +25,41 @@ from typing import Any
 import httpx
 import pyautogui
 from anthropic import Anthropic
+from PIL import ImageGrab
 
-# Screen settings
-SCREEN_WIDTH = int(os.getenv("WIDTH", 0)) or pyautogui.size()[0]
-SCREEN_HEIGHT = int(os.getenv("HEIGHT", 0)) or pyautogui.size()[1]
+# Multi-monitor support: capture the FULL virtual screen (all monitors)
+# On single monitor this is identical to pyautogui.screenshot()
+def _get_virtual_screen_bbox() -> tuple[int, int, int, int]:
+    """Return (left, top, right, bottom) of the full virtual screen."""
+    try:
+        import win32api
+        left = win32api.GetSystemMetrics(76)   # SM_XVIRTUALSCREEN
+        top = win32api.GetSystemMetrics(77)    # SM_YVIRTUALSCREEN
+        width = win32api.GetSystemMetrics(78)  # SM_CXVIRTUALSCREEN
+        height = win32api.GetSystemMetrics(79) # SM_CYVIRTUALSCREEN
+        return (left, top, left + width, top + height)
+    except ImportError:
+        w, h = pyautogui.size()
+        return (0, 0, w, h)
 
-# Scale to recommended resolution
-SCALE_WIDTH = 1024
-SCALE_HEIGHT = 768
+VIRTUAL_BBOX = _get_virtual_screen_bbox()
+SCREEN_LEFT = VIRTUAL_BBOX[0]
+SCREEN_TOP = VIRTUAL_BBOX[1]
+SCREEN_WIDTH = int(os.getenv("WIDTH", 0)) or (VIRTUAL_BBOX[2] - VIRTUAL_BBOX[0])
+SCREEN_HEIGHT = int(os.getenv("HEIGHT", 0)) or (VIRTUAL_BBOX[3] - VIRTUAL_BBOX[1])
+
+# Scale to recommended resolution (maintains aspect ratio best we can)
+SCALE_WIDTH = 1366 if SCREEN_WIDTH > 2000 else 1024
+SCALE_HEIGHT = int(SCALE_WIDTH * SCREEN_HEIGHT / SCREEN_WIDTH)
 
 SYSTEM_PROMPT = f"""You are a computer control agent. You can see the user's screen and perform actions on it.
 
 CURRENT SETUP:
 - Operating system: Windows ({platform.machine()})
-- Screen resolution: {SCREEN_WIDTH}x{SCREEN_HEIGHT} (scaled to {SCALE_WIDTH}x{SCALE_HEIGHT} for you)
+- Virtual screen: {SCREEN_WIDTH}x{SCREEN_HEIGHT} pixels (offset: {SCREEN_LEFT},{SCREEN_TOP})
+- Scaled to: {SCALE_WIDTH}x{SCALE_HEIGHT} for your coordinates
 - Current date: {datetime.today().strftime('%A, %B %d, %Y')}
+- Screenshots capture ALL monitors in a single image (left-to-right)
 - The screen may show a remote desktop (AnyDesk/TeamViewer) — treat the full screen as the target.
 
 AVAILABLE ACTIONS (use the tools provided):
@@ -146,17 +166,26 @@ TOOLS = [
 
 
 def scale_to_screen(x: int, y: int) -> tuple[int, int]:
-    """Convert from scaled coordinates to actual screen coordinates."""
-    real_x = int(x * SCREEN_WIDTH / SCALE_WIDTH)
-    real_y = int(y * SCREEN_HEIGHT / SCALE_HEIGHT)
+    """Convert from scaled coordinates to actual screen coordinates.
+
+    Handles multi-monitor virtual screen offsets (monitors left of primary
+    can have negative coordinates).
+    """
+    real_x = SCREEN_LEFT + int(x * SCREEN_WIDTH / SCALE_WIDTH)
+    real_y = SCREEN_TOP + int(y * SCREEN_HEIGHT / SCALE_HEIGHT)
     return real_x, real_y
 
 
 def take_screenshot() -> str:
-    """Take a screenshot and return base64 encoded PNG."""
-    screenshot = pyautogui.screenshot()
-    screenshot = screenshot.resize((SCALE_WIDTH, SCALE_HEIGHT))
+    """Take a screenshot of ALL monitors and return base64 encoded PNG.
+
+    Uses PIL.ImageGrab with the full virtual screen bounding box so that
+    multi-monitor setups are captured in a single image.
+    """
     import io
+
+    screenshot = ImageGrab.grab(bbox=VIRTUAL_BBOX, all_screens=True)
+    screenshot = screenshot.resize((SCALE_WIDTH, SCALE_HEIGHT))
     buf = io.BytesIO()
     screenshot.save(buf, format="PNG", optimize=True)
     return base64.b64encode(buf.getvalue()).decode()

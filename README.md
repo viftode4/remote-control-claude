@@ -1,146 +1,225 @@
 # Remote Control Agent
 
-AI-powered desktop automation agent that uses Claude to control a remote computer via AnyDesk, TeamViewer, or any remote desktop software.
+AI-powered desktop automation that uses Claude to control a remote computer through AnyDesk, TeamViewer, or any remote desktop software. Uses your existing Claude subscription via OAuth -- no API key needed.
 
 ## How It Works
 
 ```
-Your PC (runs the agent)  -->  AnyDesk/TeamViewer  -->  Remote Work PC
-         |
-    Claude AI sees your screen,
-    sends mouse clicks & keystrokes
-    through the remote desktop window
+Your PC                          Remote Work PC
+┌─────────────────┐              ┌──────────────┐
+│  Agent (Python)  │──AnyDesk───▶│  (no install  │
+│  takes screenshot│  TeamViewer │   needed)     │
+│  sends to Claude │              └──────────────┘
+│  executes clicks │
+│  types text      │
+└────────┬────────┘
+         │ OAuth
+         ▼
+   Claude API (via local proxy)
 ```
 
-The agent takes screenshots of your screen, sends them to Claude, and Claude responds with mouse/keyboard actions. If a remote desktop window (AnyDesk, TeamViewer, etc.) is open full-screen, Claude interacts with the remote machine through it.
+Claude sees your screen as a screenshot, decides what to click/type/scroll, and the agent executes those actions. When a remote desktop is open full-screen, Claude controls the remote machine through it.
 
-**Nothing needs to be installed on the remote computer.** The agent runs entirely on your local machine.
+**Nothing gets installed on the remote computer.**
 
-## Requirements
+## Prerequisites
 
-- Windows 10 or later
-- Python 3.10 - 3.13
-- An OAuth token for the Anthropic API
-- AnyDesk, TeamViewer, or any remote desktop software
+- **Windows 10+** with Python 3.10-3.13
+- **Claude Code** installed and logged in (`claude` command works in your terminal)
+- **AnyDesk / TeamViewer** or any remote desktop app
 
-## Quick Start
+That's it. The agent uses your Claude Code login -- the same OAuth token that powers `claude` in your terminal.
 
-### 1. Install
+## Setup (5 minutes)
+
+### Step 1: Clone and install
 
 ```cmd
-git clone <this-repo-url>
+git clone https://github.com/viftode4/remote-control-claude.git
 cd remote-control-claude
-setup.bat
+pip install -r requirements.txt
 ```
 
-### 2. Start the Proxy
+### Step 2: Verify Claude Code is logged in
 
 ```cmd
-start-proxy.bat
+claude --version
 ```
 
-The proxy runs on port 9090 and forwards your OAuth token to Anthropic. No API key needed.
+If this works, you're authenticated. The agent reads your OAuth token from `~/.claude/.credentials.json` automatically.
 
-### 3. Start the Agent
+### Step 3: Start the OAuth proxy
+
+The proxy reads your Claude Code credentials and handles token refresh automatically.
 
 ```cmd
-start-agent.bat
+node %USERPROFILE%\.claude\proxy\server.js
 ```
 
-Open **http://localhost:8501** in your browser.
-
-### 4. Configure the Agent UI
-
-In the sidebar:
-- **API Key**: Paste your OAuth token here
-- **Proxy URL**: `http://localhost:9090/proxy/anthropic`
-
-### 5. Use
-
-1. Connect to your remote work PC via AnyDesk/TeamViewer
-2. Set the remote desktop window to **full screen**
-3. In the agent chat, describe what you want Claude to do:
-
-> "My entire screen is an AnyDesk session to a remote computer. Open the Excel file on the desktop and copy the data from column A."
-
-## OAuth Proxy
-
-The proxy server forwards your OAuth token directly to Anthropic's API. No API key is stored anywhere on the server.
-
-### Architecture
-
+You should see:
 ```
-Agent UI  --[OAuth token]-->  Proxy  --[same OAuth token]-->  Anthropic API
+Claude proxy listening on http://127.0.0.1:8082
+Token loaded, ready
 ```
 
-Your OAuth token passes through as-is. The proxy adds:
-- **Rate limiting** per user (60 req/min default)
-- **Request logging** for auditing
-- **Optional allowlist** to restrict which tokens can use the proxy
+> **Don't have the proxy?** See [Proxy Setup](#proxy-setup) below to install it.
 
-### Optional: Token Allowlist
+### Step 4: Start the agent
 
-To restrict which OAuth tokens can use the proxy, create `proxy/allowed_tokens.txt`:
-
-```
-# One token per line
-sk-ant-token-1-here
-sk-ant-token-2-here
+```cmd
+python -m streamlit run app.py
 ```
 
-If this file doesn't exist or is empty, any OAuth token is passed through.
+### Step 5: Open the UI
 
-### Proxy Endpoints
+Go to **http://localhost:8510** in your browser.
 
-| Endpoint | Description |
-|----------|-------------|
-| `GET /health` | Health check, shows config status |
-| `POST /proxy/anthropic/v1/messages` | Proxied Anthropic Messages API |
+### Step 6: Use it
+
+1. Open AnyDesk/TeamViewer and connect to your remote work PC
+2. Set the remote desktop to **full screen**
+3. In the agent chat, tell Claude what to do:
+
+```
+Take a screenshot and describe what you see.
+```
+
+```
+Open the Excel file on the desktop, go to Sheet2, and copy the table.
+```
+
+```
+Open Chrome, go to our internal wiki, and find the IT support phone number.
+```
+
+Claude will take screenshots, click, type, and scroll to complete the task.
+
+## Proxy Setup
+
+If you don't already have the OAuth proxy, set it up:
+
+### 1. Create the proxy directory
+
+```cmd
+mkdir %USERPROFILE%\.claude\proxy
+```
+
+### 2. Install Node.js
+
+Download from https://nodejs.org if you don't have it.
+
+### 3. Copy the proxy file
+
+Copy `proxy/oauth-proxy.js` from this repo to `%USERPROFILE%\.claude\proxy\server.js`.
+
+Or create it manually -- the proxy is a single file that:
+- Reads OAuth credentials from `~/.claude/.credentials.json`
+- Refreshes tokens automatically via `console.anthropic.com`
+- Forwards requests to `api.anthropic.com` with the OAuth Bearer token
+- Listens on `http://127.0.0.1:8082`
+
+### 4. Create config
+
+Create `%USERPROFILE%\.claude\proxy\config.json`:
+
+```json
+{
+  "port": 8082,
+  "host": "127.0.0.1",
+  "default_model": "claude-sonnet-4-6",
+  "max_tokens": 8192
+}
+```
+
+### 5. Auto-start (optional)
+
+To start the proxy automatically on login, create a file at:
+
+```
+%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\claude-proxy.vbs
+```
+
+With this content:
+
+```vbs
+Set WshShell = CreateObject("WScript.Shell")
+WshShell.Run "node C:\Users\YOUR_USERNAME\.claude\proxy\server.js", 0, False
+```
+
+Replace `YOUR_USERNAME` with your Windows username.
+
+## What Can It Do?
+
+| Action | How |
+|--------|-----|
+| See the screen | Takes screenshots via `pyautogui` |
+| Click | Left click, right click, double click at any position |
+| Type text | Types strings character by character |
+| Keyboard shortcuts | `ctrl+c`, `alt+tab`, `enter`, etc. |
+| Scroll | Scroll up/down |
+| Move mouse | Move cursor without clicking |
+
+Claude decides which actions to take based on what it sees in the screenshot. It works exactly like a person sitting at your desk using your mouse and keyboard.
+
+## Multi-Monitor Support
+
+The agent captures **all monitors** in a single screenshot. If you have two monitors, Claude sees both side by side and can click on either one.
+
+```
+┌──────────────┐┌──────────────┐
+│  Monitor 1   ││  Monitor 2   │    ← Claude sees ALL of this
+│  (primary)   ││ (AnyDesk)    │       as one wide screenshot
+└──────────────┘└──────────────┘
+```
+
+**Recommended setup:** Put AnyDesk/TeamViewer on one monitor in full screen. Claude will see it and know to interact with that monitor. You can tell it explicitly:
+
+> "The right side of the screen is an AnyDesk session. Click on the desktop icon labeled 'Reports'."
+
+If you only want Claude to see one monitor, set `WIDTH` and `HEIGHT` in `.env` to that monitor's resolution.
 
 ## Tips for Best Results
 
-- Use **full-screen mode** in AnyDesk/TeamViewer for less visual noise
-- Set remote desktop quality to **"Optimize speed"** for cleaner screenshots
-- Set remote resolution to **1024x768** if possible (Claude's recommended resolution)
-- Be explicit in prompts about what's on screen
-- Set API billing limits -- screenshots consume significant tokens
-
-## Configuration
-
-All settings via environment variables in `.env`:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PROXY_PORT` | 9090 | Proxy server port |
-| `PROXY_HOST` | 0.0.0.0 | Proxy server bind address |
-| `RATE_LIMIT_PER_MINUTE` | 60 | Max requests per user per minute |
-| `WIDTH` | auto | Override screen width for screenshots |
-| `HEIGHT` | auto | Override screen height for screenshots |
+- **Full screen** your remote desktop app -- less noise for Claude to parse
+- **"Optimize speed"** in AnyDesk/TeamViewer settings -- cleaner screenshots
+- **Be specific** in your prompts -- "Click the Save button in the top-right" is better than "save it"
+- **Lower remote resolution** to 1024x768 if possible -- Claude's sweet spot
+- **Watch it work** -- the agent shows screenshots and actions in real time
+- **Multi-monitor:** Claude captures all screens. Tell it which monitor to focus on if needed
 
 ## Project Structure
 
 ```
 remote-control-claude/
-├── computer_use_demo/       # Agent core (screenshot, mouse, keyboard)
-│   ├── loop.py              # Main agent loop (calls Claude API)
-│   ├── streamlit.py         # Web UI
-│   └── tools/               # Computer control tools
-├── proxy/                   # OAuth proxy server
-│   └── server.py            # Passthrough proxy with rate limiting
-├── setup.bat                # One-time setup
-├── start-agent.bat          # Start the agent UI
-├── start-proxy.bat          # Start the proxy server
-├── .env.example             # Configuration template
-└── requirements.txt         # Python dependencies
+├── app.py                       # Main UI (Streamlit)
+├── computer_use_demo/
+│   ├── agent.py                 # Agent loop (screenshot → Claude → actions)
+│   ├── loop.py                  # Alternative loop (for API key auth)
+│   └── tools/                   # pyautogui wrappers
+├── proxy/
+│   └── server.py                # Python proxy (alternative to Node proxy)
+├── requirements.txt
+├── setup.bat
+└── .env.example
 ```
 
-## Security Considerations
+## Security
 
-- **Never give the agent access to sensitive credentials or accounts.** Claude follows instructions found in web content, which could override your instructions (prompt injection).
-- Use the agent in a supervised manner -- watch what it does.
-- The proxy should run on a trusted network.
-- Your OAuth token is forwarded as-is to Anthropic. The proxy does not store it.
+- **Supervise the agent.** Claude can be influenced by text on web pages (prompt injection). Don't leave it running unattended on sensitive systems.
+- **Don't give it credentials.** Never paste passwords into the chat or let it access login screens unsupervised.
+- The OAuth token stays local. The proxy runs on `127.0.0.1` and doesn't expose anything to the network.
+- Your Claude subscription usage applies. Screenshots are token-intensive.
+
+## Troubleshooting
+
+**"Port 8082 refused"** -- The proxy isn't running. Start it with `node %USERPROFILE%\.claude\proxy\server.js`.
+
+**"Token refresh failed"** -- Your Claude Code session expired. Run `claude` in a terminal to re-authenticate, then restart the proxy.
+
+**"Agent not clicking accurately"** -- Lower your remote desktop resolution to 1024x768. High resolutions get scaled down and lose precision.
+
+**Screenshots are blank/black** -- Some remote desktop apps use hardware acceleration that blocks screen capture. Try disabling GPU acceleration in AnyDesk/TeamViewer settings.
 
 ## Credits
 
-Based on [Anthropic Computer Use](https://docs.anthropic.com/en/docs/build-with-claude/computer-use) and the [Windows adaptation](https://github.com/sunkencity999/windows_claude_computer_use) by Christopher Bradford.
+Built on [Anthropic Computer Use](https://docs.anthropic.com/en/docs/build-with-claude/computer-use) concepts and the [Windows adaptation](https://github.com/sunkencity999/windows_claude_computer_use) by Christopher Bradford.
