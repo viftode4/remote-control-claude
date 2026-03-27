@@ -300,15 +300,11 @@ Command Exists: {os.path.exists(cmd_path)}"""
                 except Exception as e:
                     return 1, f"Error processing {base_cmd} command: {str(e)}", ""
                 
-                # Network commands need shell=True to work properly
-                use_shell = base_cmd in ['ping', 'ipconfig', 'netstat', 'tracert', 'nslookup']
-                
                 process = await asyncio.create_subprocess_shell(
                     f'cmd /c {cmd}',
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     creationflags=subprocess.CREATE_NO_WINDOW,
-                    shell=use_shell
                 )
                 stdout, stderr = await process.communicate()
                 try:
