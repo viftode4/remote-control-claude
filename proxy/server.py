@@ -1,32 +1,29 @@
 """
 OAuth Proxy Server for Anthropic API.
 
-This proxy sits between the computer use agent and the Anthropic API.
-It accepts requests authenticated with Bearer tokens (OAuth) and forwards
-them to the Anthropic API using the real API key stored server-side.
+Pure passthrough proxy — the user's OAuth token IS the authentication.
+No API key stored on the server. The proxy forwards the user's Bearer
+token directly to Anthropic's API.
 
-This way, team members never need the raw Anthropic API key -- they only
-need a proxy token issued by the administrator.
-
-Tokens have configurable expiration and can be refreshed via the /token/refresh
-endpoint using the original token before it expires.
+The proxy provides:
+- Rate limiting per user
+- Request logging / auditing
+- Optional allowlist of permitted OAuth tokens
 """
 
 import hashlib
 import json
 import logging
 import os
-import secrets
 import sys
 import time
-from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 
 load_dotenv()
 
@@ -36,21 +33,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger("proxy")
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-ANTHROPIC_BASE_URL = "https://api.anthropic.com"
+ANTHROPIC_BASE_URL = os.getenv(
+    "ANTHROPIC_BASE_URL_UPSTREAM", "https://api.anthropic.com"
+)
 
-# Token storage
-TOKENS_FILE = Path(__file__).parent / "authorized_tokens.json"
+# Optional: restrict to specific OAuth tokens (one per line)
+# If empty or missing, any valid OAuth token is passed through.
+ALLOWLIST_FILE = Path(__file__).parent / "allowed_tokens.txt"
 
-# Token expiration in seconds (default: 24 hours, 0 = never expire)
-TOKEN_EXPIRY_SECONDS = int(os.getenv("TOKEN_EXPIRY_SECONDS", str(24 * 60 * 60)))
-
-# Rate limiting: max requests per token per minute
+# Rate limiting: max requests per user per minute
 RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "60"))
 
 app = FastAPI(
     title="Anthropic OAuth Proxy",
-    description="Proxy server that authenticates via Bearer tokens and forwards requests to the Anthropic API.",
+    description="Passthrough proxy that forwards OAuth Bearer tokens to the Anthropic API. No API key required.",
 )
 
 app.add_middleware(
@@ -60,38 +56,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory rate limiting store
+# In-memory rate limiting
 _rate_limits: dict[str, list[float]] = {}
 
 
-@dataclass(frozen=True)
-class TokenRecord:
-    token: str
-    label: str
-    created_at: float
-    expires_at: float  # 0 = never expires
-    revoked: bool
-
-
-def _load_tokens() -> dict[str, dict]:
-    """Load token records from the JSON file."""
-    if not TOKENS_FILE.exists():
-        return {}
-    try:
-        data = json.loads(TOKENS_FILE.read_text())
-        return data.get("tokens", {})
-    except (json.JSONDecodeError, KeyError):
-        return {}
-
-
-def _save_tokens(tokens: dict[str, dict]) -> None:
-    """Save token records to the JSON file."""
-    TOKENS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    TOKENS_FILE.write_text(json.dumps({"tokens": tokens}, indent=2))
-
-
 def _hash_token(token: str) -> str:
-    """Hash a token for rate limit tracking."""
+    """Hash a token for rate limit tracking (never store raw tokens)."""
     return hashlib.sha256(token.encode()).hexdigest()[:16]
 
 
@@ -114,46 +84,41 @@ def _check_rate_limit(token_hash: str) -> bool:
     return True
 
 
-def _validate_bearer_token(request: Request) -> str:
-    """Extract and validate the Bearer token from the request."""
+def _load_allowlist() -> set[str] | None:
+    """Load optional token allowlist. Returns None if no allowlist (open mode)."""
+    if not ALLOWLIST_FILE.exists():
+        return None
+    tokens = set()
+    for line in ALLOWLIST_FILE.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            tokens.add(line)
+    return tokens if tokens else None
+
+
+def _extract_and_validate_token(request: Request) -> str:
+    """Extract Bearer token from request, validate allowlist and rate limit."""
     auth_header = request.headers.get("authorization", "")
 
-    if not auth_header.startswith("Bearer "):
+    # Accept both "Bearer xxx" and raw token in x-api-key header
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:].strip()
+    elif request.headers.get("x-api-key"):
+        token = request.headers["x-api-key"].strip()
+    else:
         raise HTTPException(
             status_code=401,
-            detail="Missing or invalid Authorization header. Use: Bearer <token>",
+            detail="Missing authentication. Provide your OAuth token as: Authorization: Bearer <token>",
         )
 
-    token = auth_header[7:].strip()
     if not token:
-        raise HTTPException(status_code=401, detail="Empty bearer token")
+        raise HTTPException(status_code=401, detail="Empty token")
 
-    tokens = _load_tokens()
-
-    if not tokens:
-        raise HTTPException(
-            status_code=503,
-            detail="No authorized tokens configured. Run generate-token.bat first.",
-        )
-
-    record = tokens.get(token)
-    if record is None:
-        logger.warning("Rejected unauthorized token attempt")
-        raise HTTPException(status_code=403, detail="Invalid or revoked token")
-
-    if record.get("revoked", False):
-        logger.warning("Rejected revoked token: %s", record.get("label", "unknown"))
-        raise HTTPException(status_code=403, detail="Token has been revoked")
-
-    # Check expiration
-    expires_at = record.get("expires_at", 0)
-    if expires_at > 0 and time.time() > expires_at:
-        remaining = -1
-        raise HTTPException(
-            status_code=401,
-            detail="Token has expired. Use POST /token/refresh to get a new one.",
-            headers={"X-Token-Expired": "true"},
-        )
+    # Check allowlist if configured
+    allowlist = _load_allowlist()
+    if allowlist is not None and token not in allowlist:
+        logger.warning("Rejected token not in allowlist")
+        raise HTTPException(status_code=403, detail="Token not in allowlist")
 
     # Rate limiting
     token_hash = _hash_token(token)
@@ -169,83 +134,15 @@ def _validate_bearer_token(request: Request) -> str:
 @app.get("/health")
 async def health() -> dict:
     """Health check endpoint."""
-    has_api_key = bool(ANTHROPIC_API_KEY)
-    tokens = _load_tokens()
-    active_tokens = sum(
-        1 for t in tokens.values()
-        if not t.get("revoked", False)
-        and (t.get("expires_at", 0) == 0 or time.time() < t.get("expires_at", 0))
-    )
+    allowlist = _load_allowlist()
     return {
         "status": "ok",
-        "anthropic_api_key_configured": has_api_key,
-        "total_tokens": len(tokens),
-        "active_tokens": active_tokens,
-        "token_expiry_seconds": TOKEN_EXPIRY_SECONDS,
+        "mode": "oauth_passthrough",
+        "upstream": ANTHROPIC_BASE_URL,
+        "allowlist_configured": allowlist is not None,
+        "allowlisted_tokens": len(allowlist) if allowlist else "open (any token accepted)",
+        "rate_limit_per_minute": RATE_LIMIT_PER_MINUTE,
     }
-
-
-@app.post("/token/refresh")
-async def refresh_token(request: Request) -> JSONResponse:
-    """
-    Refresh an existing token before it expires.
-
-    Send the current token as a Bearer header. If valid (even if expired within
-    a grace period of 7 days), a new token is issued and the old one is revoked.
-    """
-    auth_header = request.headers.get("authorization", "")
-    if not auth_header.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Bearer token required")
-
-    old_token = auth_header[7:].strip()
-    tokens = _load_tokens()
-    record = tokens.get(old_token)
-
-    if record is None:
-        raise HTTPException(status_code=403, detail="Unknown token")
-
-    if record.get("revoked", False):
-        raise HTTPException(status_code=403, detail="Token has been permanently revoked")
-
-    # Allow refresh within a 7-day grace period after expiry
-    expires_at = record.get("expires_at", 0)
-    grace_period = 7 * 24 * 60 * 60  # 7 days
-    if expires_at > 0 and time.time() > (expires_at + grace_period):
-        raise HTTPException(
-            status_code=403,
-            detail="Token expired beyond the 7-day refresh grace period. Request a new token from your administrator.",
-        )
-
-    # Generate new token
-    now = time.time()
-    new_token = secrets.token_urlsafe(32)
-    new_expires = now + TOKEN_EXPIRY_SECONDS if TOKEN_EXPIRY_SECONDS > 0 else 0
-
-    # Revoke old token
-    record["revoked"] = True
-    record["revoked_at"] = now
-    record["replaced_by"] = _hash_token(new_token)
-    tokens[old_token] = record
-
-    # Create new token record
-    tokens[new_token] = {
-        "label": record.get("label", "unknown"),
-        "created_at": now,
-        "expires_at": new_expires,
-        "revoked": False,
-        "refreshed_from": _hash_token(old_token),
-    }
-
-    _save_tokens(tokens)
-
-    logger.info("Token refreshed for user: %s", record.get("label", "unknown"))
-
-    return JSONResponse({
-        "access_token": new_token,
-        "token_type": "bearer",
-        "expires_in": TOKEN_EXPIRY_SECONDS if TOKEN_EXPIRY_SECONDS > 0 else None,
-        "expires_at": new_expires if new_expires > 0 else None,
-    })
 
 
 @app.api_route(
@@ -254,39 +151,43 @@ async def refresh_token(request: Request) -> JSONResponse:
 )
 async def proxy_anthropic(request: Request, path: str) -> StreamingResponse:
     """
-    Forward authenticated requests to the Anthropic API.
+    Forward the request to Anthropic API with the user's own OAuth token.
 
-    The agent points its base URL to http://localhost:9090/proxy/anthropic
-    and this proxy swaps the Bearer token for the real API key.
+    The user's Bearer token is passed through as-is — this proxy does NOT
+    inject any server-side API key.
     """
-    _validate_bearer_token(request)
+    oauth_token = _extract_and_validate_token(request)
 
-    if not ANTHROPIC_API_KEY:
-        raise HTTPException(
-            status_code=503,
-            detail="ANTHROPIC_API_KEY not configured on the proxy server",
-        )
-
+    # Build the target URL
     target_url = f"{ANTHROPIC_BASE_URL}/{path}"
     if request.url.query:
         target_url += f"?{request.url.query}"
 
     body = await request.body()
 
-    # Build headers -- replace auth with real API key
+    # Build headers — forward the user's OAuth token to Anthropic
     forward_headers = {}
     for key, value in request.headers.items():
         lower_key = key.lower()
-        if lower_key in ("host", "authorization", "content-length", "transfer-encoding"):
+        if lower_key in ("host", "content-length", "transfer-encoding"):
             continue
+        # Keep authorization and x-api-key as-is — it's the user's token
         forward_headers[key] = value
 
-    forward_headers["x-api-key"] = ANTHROPIC_API_KEY
-    forward_headers["anthropic-version"] = request.headers.get(
+    # Ensure the token is sent both ways Anthropic might expect it
+    forward_headers["x-api-key"] = oauth_token
+    forward_headers["authorization"] = f"Bearer {oauth_token}"
+    forward_headers.setdefault(
         "anthropic-version", "2023-06-01"
     )
 
-    logger.info("Proxying %s %s -> %s", request.method, request.url.path, target_url)
+    logger.info(
+        "Proxying %s %s -> %s (user: %s)",
+        request.method,
+        request.url.path,
+        target_url,
+        _hash_token(oauth_token),
+    )
 
     # Check if the request wants streaming
     is_streaming = False
@@ -343,105 +244,34 @@ async def proxy_anthropic(request: Request, path: str) -> StreamingResponse:
             )
 
 
-def generate_token(label: str = "user") -> str:
-    """Generate a new token with expiration and save it."""
-    now = time.time()
-    token = secrets.token_urlsafe(32)
-    expires_at = now + TOKEN_EXPIRY_SECONDS if TOKEN_EXPIRY_SECONDS > 0 else 0
-
-    tokens = _load_tokens()
-    tokens[token] = {
-        "label": label,
-        "created_at": now,
-        "expires_at": expires_at,
-        "revoked": False,
-    }
-    _save_tokens(tokens)
-    return token, expires_at
-
-
 def main() -> None:
-    """CLI entry point for managing the proxy."""
+    """Start the proxy server."""
     import uvicorn
-
-    if len(sys.argv) > 1 and sys.argv[1] == "generate-token":
-        label = sys.argv[2] if len(sys.argv) > 2 else "user"
-        token, expires_at = generate_token(label)
-
-        print(f"\nGenerated new token for '{label}':\n")
-        print(f"  {token}\n")
-        if expires_at > 0:
-            from datetime import datetime
-            exp_str = datetime.fromtimestamp(expires_at).strftime("%Y-%m-%d %H:%M:%S")
-            hours = TOKEN_EXPIRY_SECONDS / 3600
-            print(f"  Expires: {exp_str} ({hours:.0f} hours)")
-            print(f"  Refresh: POST /token/refresh with this token before expiry")
-            print(f"  Grace period: 7 days after expiry for refresh")
-        else:
-            print("  Expires: never")
-        print(f"\n  Token saved to {TOKENS_FILE}")
-        print("  Share this token with the user. They enter it as the API key in the agent UI.")
-        return
-
-    if len(sys.argv) > 1 and sys.argv[1] == "list-tokens":
-        tokens = _load_tokens()
-        if not tokens:
-            print("No tokens configured.")
-            return
-        print(f"\n{'Label':<15} {'Status':<12} {'Created':<20} {'Expires':<20}")
-        print("-" * 70)
-        from datetime import datetime
-        for token_val, record in tokens.items():
-            label = record.get("label", "unknown")
-            revoked = record.get("revoked", False)
-            expires = record.get("expires_at", 0)
-            created = datetime.fromtimestamp(record.get("created_at", 0)).strftime("%Y-%m-%d %H:%M")
-
-            if revoked:
-                status = "revoked"
-            elif expires > 0 and time.time() > expires:
-                status = "expired"
-            else:
-                status = "active"
-
-            exp_str = datetime.fromtimestamp(expires).strftime("%Y-%m-%d %H:%M") if expires > 0 else "never"
-            preview = token_val[:8] + "..."
-            print(f"{label:<15} {status:<12} {created:<20} {exp_str:<20} {preview}")
-        print()
-        return
-
-    if len(sys.argv) > 1 and sys.argv[1] == "revoke-token":
-        if len(sys.argv) < 3:
-            print("Usage: python -m proxy.server revoke-token <token-prefix>")
-            return
-        prefix = sys.argv[2]
-        tokens = _load_tokens()
-        found = False
-        for token_val, record in tokens.items():
-            if token_val.startswith(prefix):
-                record["revoked"] = True
-                record["revoked_at"] = time.time()
-                found = True
-                print(f"Revoked token: {token_val[:8]}... (label: {record.get('label', 'unknown')})")
-        if found:
-            _save_tokens(tokens)
-        else:
-            print(f"No token found starting with '{prefix}'")
-        return
-
-    if not ANTHROPIC_API_KEY:
-        print("WARNING: ANTHROPIC_API_KEY environment variable is not set!")
-        print("Set it in .env or as an environment variable before starting the proxy.\n")
 
     port = int(os.getenv("PROXY_PORT", "9090"))
     host = os.getenv("PROXY_HOST", "0.0.0.0")
 
-    print(f"\nStarting Anthropic OAuth Proxy on {host}:{port}")
+    allowlist = _load_allowlist()
+    mode = "allowlist" if allowlist else "open (any OAuth token)"
+
+    print(f"\nAnthropic OAuth Proxy")
+    print(f"{'=' * 40}")
+    print(f"Mode:           {mode}")
+    print(f"Upstream:       {ANTHROPIC_BASE_URL}")
     print(f"Proxy endpoint: http://localhost:{port}/proxy/anthropic")
     print(f"Health check:   http://localhost:{port}/health")
-    print(f"Token refresh:  POST http://localhost:{port}/token/refresh")
-    print(f"Token expiry:   {TOKEN_EXPIRY_SECONDS}s ({TOKEN_EXPIRY_SECONDS/3600:.0f}h)")
-    print(f"Tokens file:    {TOKENS_FILE}\n")
+    print(f"Rate limit:     {RATE_LIMIT_PER_MINUTE} req/min per token")
+    print()
+    print(f"Users enter their OAuth token as the API key in the agent UI,")
+    print(f"and set the Proxy URL to: http://localhost:{port}/proxy/anthropic")
+    print()
+
+    if allowlist:
+        print(f"Allowlisted tokens: {len(allowlist)} (from {ALLOWLIST_FILE})")
+    else:
+        print(f"No allowlist — any OAuth token will be passed through.")
+        print(f"To restrict access, add tokens to {ALLOWLIST_FILE}")
+    print()
 
     uvicorn.run(app, host=host, port=port, log_level="info")
 

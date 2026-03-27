@@ -8,6 +8,7 @@ __pycache__/
 # Secrets
 proxy/authorized_tokens.txt
 proxy/authorized_tokens.json
+proxy/allowed_tokens.txt
 
 # IDE
 .vscode/
