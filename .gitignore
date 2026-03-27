@@ -1,0 +1,25 @@
+# Environment
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Secrets
+proxy/authorized_tokens.txt
+proxy/authorized_tokens.json
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Anthropic
+.anthropic/
+
+# Screenshots
+anthropic_outputs/
