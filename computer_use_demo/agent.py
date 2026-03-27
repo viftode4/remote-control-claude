@@ -171,6 +171,7 @@ def scale_to_screen(x: int, y: int) -> tuple[int, int]:
     Handles multi-monitor virtual screen offsets (monitors left of primary
     can have negative coordinates).
     """
+    x, y = int(x), int(y)
     real_x = SCREEN_LEFT + int(x * SCREEN_WIDTH / SCALE_WIDTH)
     real_y = SCREEN_TOP + int(y * SCREEN_HEIGHT / SCALE_HEIGHT)
     return real_x, real_y
