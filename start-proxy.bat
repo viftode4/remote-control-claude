@@ -1,24 +1,25 @@
 @echo off
-echo ============================================
-echo   OAuth Proxy - Starting
-echo ============================================
+echo Starting OAuth proxy...
 echo.
 
 where node >nul 2>&1
 if errorlevel 1 (
-    echo ERROR: Node.js is not installed.
-    echo Download it from https://nodejs.org
+    echo ERROR: Node.js is not installed. Download from https://nodejs.org
     pause
     exit /b 1
 )
 
 if exist "%USERPROFILE%\.claude\proxy\server.js" (
-    echo Starting proxy from Claude Code installation...
     node "%USERPROFILE%\.claude\proxy\server.js"
 ) else (
-    echo ERROR: Proxy not found at %USERPROFILE%\.claude\proxy\server.js
-    echo.
-    echo See README.md "Proxy Setup" section for installation instructions.
-    pause
-    exit /b 1
+    echo Proxy not installed yet. Setting it up now...
+    mkdir "%USERPROFILE%\.claude\proxy" 2>nul
+    copy "proxy\oauth-proxy.js" "%USERPROFILE%\.claude\proxy\server.js" >nul
+
+    if not exist "%USERPROFILE%\.claude\proxy\config.json" (
+        echo {"port": 8082, "host": "127.0.0.1", "default_model": "claude-sonnet-4-6", "max_tokens": 8192} > "%USERPROFILE%\.claude\proxy\config.json"
+    )
+
+    echo Proxy installed. Starting...
+    node "%USERPROFILE%\.claude\proxy\server.js"
 )
