@@ -1,0 +1,307 @@
+"""
+Custom computer use agent loop that works with OAuth.
+
+Instead of relying on Anthropic's computer-use beta tools (which require
+API key auth), this agent uses Claude's vision capability to see the screen
+and returns structured tool calls via a custom tool schema.
+
+Flow:
+1. Take screenshot with pyautogui
+2. Send as image to Claude via OAuth proxy (regular messages API)
+3. Claude responds with tool_use blocks (click, type, key, screenshot)
+4. We execute those actions locally
+5. Repeat
+"""
+
+import asyncio
+import base64
+import json
+import os
+import platform
+from collections.abc import Callable
+from datetime import datetime
+from typing import Any
+
+import httpx
+import pyautogui
+from anthropic import Anthropic
+
+# Screen settings
+SCREEN_WIDTH = int(os.getenv("WIDTH", 0)) or pyautogui.size()[0]
+SCREEN_HEIGHT = int(os.getenv("HEIGHT", 0)) or pyautogui.size()[1]
+
+# Scale to recommended resolution
+SCALE_WIDTH = 1024
+SCALE_HEIGHT = 768
+
+SYSTEM_PROMPT = f"""You are a computer control agent. You can see the user's screen and perform actions on it.
+
+CURRENT SETUP:
+- Operating system: Windows ({platform.machine()})
+- Screen resolution: {SCREEN_WIDTH}x{SCREEN_HEIGHT} (scaled to {SCALE_WIDTH}x{SCALE_HEIGHT} for you)
+- Current date: {datetime.today().strftime('%A, %B %d, %Y')}
+- The screen may show a remote desktop (AnyDesk/TeamViewer) — treat the full screen as the target.
+
+AVAILABLE ACTIONS (use the tools provided):
+- screenshot: Capture the current screen
+- click: Click at coordinates (x, y) with left/right/double click
+- type_text: Type a string of text
+- key_press: Press keyboard keys (e.g., "enter", "ctrl+c", "alt+tab")
+- mouse_move: Move mouse to coordinates (x, y)
+- scroll: Scroll up or down at current position
+
+COORDINATE SYSTEM:
+- All coordinates are in the {SCALE_WIDTH}x{SCALE_HEIGHT} scaled space
+- (0, 0) is top-left, ({SCALE_WIDTH}, {SCALE_HEIGHT}) is bottom-right
+
+IMPORTANT RULES:
+- ALWAYS start by taking a screenshot to see the current state
+- After performing actions, take another screenshot to verify the result
+- Be precise with coordinates — click in the center of UI elements
+- When typing, first click on the input field
+- For keyboard shortcuts, use key_press with modifiers (e.g., "ctrl+a")
+"""
+
+TOOLS = [
+    {
+        "name": "screenshot",
+        "description": "Take a screenshot of the current screen to see what's on it.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "click",
+        "description": "Click at a position on the screen.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "integer", "description": f"X coordinate (0-{SCALE_WIDTH})"},
+                "y": {"type": "integer", "description": f"Y coordinate (0-{SCALE_HEIGHT})"},
+                "button": {
+                    "type": "string",
+                    "enum": ["left", "right", "double"],
+                    "description": "Which button to click (default: left)",
+                },
+            },
+            "required": ["x", "y"],
+        },
+    },
+    {
+        "name": "type_text",
+        "description": "Type text at the current cursor position.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Text to type"},
+            },
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "key_press",
+        "description": "Press keyboard keys. For combos use '+' (e.g., 'ctrl+c', 'alt+tab', 'enter').",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "keys": {"type": "string", "description": "Key(s) to press"},
+            },
+            "required": ["keys"],
+        },
+    },
+    {
+        "name": "mouse_move",
+        "description": "Move mouse cursor to a position without clicking.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "integer", "description": f"X coordinate (0-{SCALE_WIDTH})"},
+                "y": {"type": "integer", "description": f"Y coordinate (0-{SCALE_HEIGHT})"},
+            },
+            "required": ["x", "y"],
+        },
+    },
+    {
+        "name": "scroll",
+        "description": "Scroll up or down at the current mouse position.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "direction": {
+                    "type": "string",
+                    "enum": ["up", "down"],
+                    "description": "Scroll direction",
+                },
+                "amount": {
+                    "type": "integer",
+                    "description": "Number of scroll clicks (default: 3)",
+                },
+            },
+            "required": ["direction"],
+        },
+    },
+]
+
+
+def scale_to_screen(x: int, y: int) -> tuple[int, int]:
+    """Convert from scaled coordinates to actual screen coordinates."""
+    real_x = int(x * SCREEN_WIDTH / SCALE_WIDTH)
+    real_y = int(y * SCREEN_HEIGHT / SCALE_HEIGHT)
+    return real_x, real_y
+
+
+def take_screenshot() -> str:
+    """Take a screenshot and return base64 encoded PNG."""
+    screenshot = pyautogui.screenshot()
+    screenshot = screenshot.resize((SCALE_WIDTH, SCALE_HEIGHT))
+    import io
+    buf = io.BytesIO()
+    screenshot.save(buf, format="PNG", optimize=True)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def execute_tool(name: str, input_data: dict) -> dict:
+    """Execute a tool action and return the result."""
+    if name == "screenshot":
+        img_b64 = take_screenshot()
+        return {"type": "image", "base64": img_b64}
+
+    elif name == "click":
+        x, y = scale_to_screen(input_data["x"], input_data["y"])
+        button = input_data.get("button", "left")
+        if button == "double":
+            pyautogui.doubleClick(x, y)
+        elif button == "right":
+            pyautogui.rightClick(x, y)
+        else:
+            pyautogui.click(x, y)
+        return {"type": "text", "text": f"Clicked {button} at ({x}, {y})"}
+
+    elif name == "type_text":
+        text = input_data["text"]
+        pyautogui.write(text, interval=0.02)
+        return {"type": "text", "text": f"Typed: {text[:50]}{'...' if len(text) > 50 else ''}"}
+
+    elif name == "key_press":
+        keys = input_data["keys"]
+        pyautogui.hotkey(*keys.split("+"))
+        return {"type": "text", "text": f"Pressed: {keys}"}
+
+    elif name == "mouse_move":
+        x, y = scale_to_screen(input_data["x"], input_data["y"])
+        pyautogui.moveTo(x, y)
+        return {"type": "text", "text": f"Moved mouse to ({x}, {y})"}
+
+    elif name == "scroll":
+        direction = input_data["direction"]
+        amount = input_data.get("amount", 3)
+        clicks = amount if direction == "up" else -amount
+        pyautogui.scroll(clicks)
+        return {"type": "text", "text": f"Scrolled {direction} {amount} clicks"}
+
+    return {"type": "text", "text": f"Unknown tool: {name}"}
+
+
+async def agent_loop(
+    *,
+    user_message: str,
+    model: str = "claude-sonnet-4-6",
+    system_suffix: str = "",
+    base_url: str | None = None,
+    api_key: str = "proxy-handles-auth",
+    max_turns: int = 20,
+    output_callback: Callable | None = None,
+    tool_callback: Callable | None = None,
+) -> list[dict]:
+    """
+    Run the computer use agent loop.
+
+    Returns the full message history.
+    """
+    if base_url is None:
+        base_url = os.getenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:8082")
+
+    client = Anthropic(api_key=api_key, base_url=base_url)
+
+    system = SYSTEM_PROMPT
+    if system_suffix:
+        system += f"\n\n{system_suffix}"
+
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": user_message}]}
+    ]
+
+    for turn in range(max_turns):
+        response = client.messages.create(
+            model=model,
+            max_tokens=1024,
+            system=system,
+            tools=TOOLS,
+            messages=messages,
+        )
+
+        # Process response
+        assistant_content = []
+        tool_results = []
+        has_tool_use = False
+
+        for block in response.content:
+            if block.type == "text":
+                assistant_content.append({"type": "text", "text": block.text})
+                if output_callback:
+                    output_callback({"type": "text", "text": block.text})
+            elif block.type == "tool_use":
+                has_tool_use = True
+                assistant_content.append({
+                    "type": "tool_use",
+                    "id": block.id,
+                    "name": block.name,
+                    "input": block.input,
+                })
+                if output_callback:
+                    output_callback({
+                        "type": "tool_use",
+                        "name": block.name,
+                        "input": block.input,
+                    })
+
+                # Execute the tool
+                result = execute_tool(block.name, block.input)
+
+                if result["type"] == "image":
+                    tool_result_content = [
+                        {"type": "text", "text": "Screenshot captured."},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": result["base64"],
+                            },
+                        },
+                    ]
+                else:
+                    tool_result_content = [
+                        {"type": "text", "text": result["text"]}
+                    ]
+
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": tool_result_content,
+                })
+
+                if tool_callback:
+                    tool_callback(block.name, result)
+
+        messages.append({"role": "assistant", "content": assistant_content})
+
+        if not has_tool_use:
+            # Claude is done — no more tool calls
+            break
+
+        messages.append({"role": "user", "content": tool_results})
+
+    return messages

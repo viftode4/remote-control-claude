@@ -99,12 +99,17 @@ async def sampling_loop(
         image_truncation_threshold = 10
 
         if provider == APIProvider.ANTHROPIC:
-            # Support custom base URL for proxy server
-            base_url = os.getenv("ANTHROPIC_BASE_URL")
-            client_kwargs = {"api_key": api_key}
-            if base_url:
-                client_kwargs["base_url"] = base_url
-            client = Anthropic(**client_kwargs)
+            # Support OAuth proxy: point to local proxy that handles
+            # OAuth token refresh and injects required headers/betas.
+            base_url = os.getenv(
+                "ANTHROPIC_BASE_URL", "http://127.0.0.1:8082"
+            )
+            # The proxy handles auth — send a dummy key so the SDK
+            # doesn't complain, the proxy replaces it with the real token.
+            client = Anthropic(
+                api_key=api_key or "proxy-handles-auth",
+                base_url=base_url,
+            )
             enable_prompt_caching = True
         elif provider == APIProvider.VERTEX:
             client = AnthropicVertex()
